@@ -1,8 +1,65 @@
 import { NextResponse } from 'next/server';
 import axios from 'axios';
 
-const activeCalls = new Map(); // Store to track recent outbound calls
+// Constants
+const ACTIVE_CALL_TIMEOUT = 10000; // 10 seconds in milliseconds
+
+// Store to track recent outbound calls with timestamps
+const activeCalls = new Map(); // Map<string, { timestamp: number, timeoutId: NodeJS.Timeout }>
 const sentLinks = new Map(); // Store to track sent meeting links
+
+// Helper function to manage active calls
+function addActiveCall(customerNumber) {
+  // Clear any existing timeout for this number if it exists
+  if (activeCalls.has(customerNumber)) {
+    const existing = activeCalls.get(customerNumber);
+    clearTimeout(existing.timeoutId);
+  }
+
+  // Set new timeout and store both timestamp and timeout ID
+  const timestamp = Date.now();
+  const timeoutId = setTimeout(() => {
+    if (activeCalls.has(customerNumber)) {
+      const call = activeCalls.get(customerNumber);
+      // Only delete if this is the same timestamp (no new call has been made)
+      if (call.timestamp === timestamp) {
+        activeCalls.delete(customerNumber);
+        console.log(`Removed ${customerNumber} from active calls after timeout`);
+      }
+    }
+  }, ACTIVE_CALL_TIMEOUT);
+
+  // Store both timestamp and timeout ID
+  activeCalls.set(customerNumber, { timestamp, timeoutId });
+  console.log(`Added ${customerNumber} to active calls, will be removed in 10 seconds`);
+}
+
+// Helper function to check if a call is active
+function isCallActive(customerNumber) {
+  if (!activeCalls.has(customerNumber)) return false;
+
+  const call = activeCalls.get(customerNumber);
+  const elapsed = Date.now() - call.timestamp;
+
+  // If the call has expired but hasn't been cleaned up yet, clean it up now
+  if (elapsed >= ACTIVE_CALL_TIMEOUT) {
+    clearTimeout(call.timeoutId);
+    activeCalls.delete(customerNumber);
+    return false;
+  }
+
+  return true;
+}
+
+// Helper function to remove active call immediately
+function removeActiveCall(customerNumber) {
+  if (activeCalls.has(customerNumber)) {
+    const call = activeCalls.get(customerNumber);
+    clearTimeout(call.timeoutId);
+    activeCalls.delete(customerNumber);
+    console.log(`Removed ${customerNumber} from active calls immediately`);
+  }
+}
 
 export async function POST(request) {
   try {
@@ -51,8 +108,8 @@ export async function POST(request) {
         return NextResponse.json({ success: false, message: 'No customer number found' }, { status: 400 });
       }
 
-      // Prevent duplicate call initiation
-      if (activeCalls.has(customerNumber)) {
+      // Prevent duplicate call initiation using the enhanced check
+      if (isCallActive(customerNumber)) {
         console.log('Outbound call already in progress for this customer, skipping.');
         return NextResponse.json({ success: false, message: 'Outbound call already in progress' }, { status: 409 });
       }
@@ -65,32 +122,8 @@ export async function POST(request) {
         return NextResponse.json({ success: false, message: 'Failed to create meeting link' }, { status: 500 });
       }
 
-      // Track this call to prevent duplicates
-      activeCalls.set(customerNumber, true);
-
-      // Trigger the call flow
-      // try {
-      //   const callInitiationResponse = await axios.post(
-      //     `${process.env.SERVER_URL}/api/initiate-outbound-call`,
-      //     { customerNumber, conversationId: conversation_id, meetingId },
-      //     { headers: { 'Content-Type': 'application/json' } }
-      //   );
-
-      //   if (callInitiationResponse.data.success) {
-      //     console.log('Call initiation process started');
-      //     // Clear active call entry after a timeout (10 seconds)
-      //     setTimeout(() => activeCalls.delete(customerNumber), 100000); // 10 seconds
-      //     return NextResponse.json({ success: true, message: 'Call initiation process started' });
-      //   } else {
-      //     console.log('Failed to start call initiation');
-      //     activeCalls.delete(customerNumber); // Remove immediately if call initiation failed
-      //     return NextResponse.json({ success: false, message: 'Failed to start call initiation' }, { status: 500 });
-      //   }
-      // } catch (error) {
-      //   logAxiosError("Error initiating call", error);
-      //   activeCalls.delete(customerNumber); // Remove in case of error
-      //   return NextResponse.json({ success: false, error: 'Failed to initiate call' }, { status: 500 });
-      // }
+      // Add to active calls with enhanced management
+      addActiveCall(customerNumber);
 
       try {
         const webhookUrl = `${process.env.SERVER_URL}/api/dyte-agent-joined-outbound-call?customerNumber=${encodeURIComponent(
@@ -118,12 +151,10 @@ export async function POST(request) {
         return NextResponse.json({ success: true, message: "Dyte webhook registered, waiting for agent to join." });
       } catch (error) {
         console.log("Failed to register Dyte webhook.");
-        activeCalls.delete(customerNumber); // Remove in case of error
+        removeActiveCall(customerNumber); // Use the new helper function for immediate removal
         logAxiosError("Error registering Dyte webhook", error);
         return NextResponse.json({ success: false, message: "Failed to register Dyte webhook" }, { status: 500 });
       }
-
-
     }
 
     return NextResponse.json({ success: true, message: 'Call initiation process started.' });
